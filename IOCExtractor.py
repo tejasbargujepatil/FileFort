@@ -11,6 +11,11 @@ from threading import Thread
 import time
 import webbrowser
 import queue
+import os
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from hashlib import sha256
+import logging
 
 # Define regex patterns for IOCs
 md5_pattern = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F])")
@@ -23,6 +28,34 @@ url_pattern = re.compile(r"https?://(?:[A-Za-z0-9\-]+\.)+[A-Za-z0-9]{2,}(?::\d{1
 email_pattern = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
 mac_pattern = re.compile(r"(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}")
 path_pattern = re.compile(r"[a-zA-Z]:\\(?:[\w\s]+\\)*\w+\.\w+|\/(?:[\w\s]+\/)*\w+\.\w+")
+
+# Secure storage directory
+secure_storage_dir = "secure_storage"
+os.makedirs(secure_storage_dir, exist_ok=True)
+
+# Logger configuration
+logging.basicConfig(
+    filename="filefort.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filemode="a"
+)
+
+# Encryption utility
+def encrypt_file(file_path: str, key: bytes) -> bytes:
+    """Encrypt the contents of a file using AES-GCM."""
+    try:
+        with open(file_path, "rb") as f:
+            plaintext = f.read()
+        
+        iv = os.urandom(12)  # 12 bytes IV for AES-GCM
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+        return iv + encryptor.tag + ciphertext
+    except Exception as e:
+        logging.error(f"Encryption failed for {file_path}: {e}")
+        return None
 
 # Define text extraction functions
 def get_pdf_text(pdf_path: str) -> str:
@@ -52,137 +85,19 @@ def enrich_with_virustotal(ioc: str, api_key: str) -> dict:
     else:
         return {"error": "Failed to enrich IOC"}
 
-# GUI class
+# Application GUI class
 class IOCExtractorApp:
-    def __init__(self, root):
+    def __init__(self, root, encryption_key: bytes):
         self.root = root
-        self.root.title("IOC Extractor")
-        self.root.geometry("900x650")
-
-        # File list
+        self.root.title("IOC Extractor and Secure File Processor")
+        self.encryption_key = encryption_key
         self.files = []
         self.results = {}
         self.api_key = None
         self.queue = queue.Queue()
 
-        # Add menu bar
-        self.create_menu()
-
         # UI components
         self.create_widgets()
-
-        # Process results from thread
-        self.root.after(100, self.process_queue)
-
-    def create_menu(self):
-        menu_bar = tk.Menu(self.root)
-
-        # File menu
-        file_menu = tk.Menu(menu_bar, tearoff=0)
-        file_menu.add_command(label="Add Files", command=self.add_files)
-        file_menu.add_command(label="Exit", command=self.root.quit)
-        menu_bar.add_cascade(label="File", menu=file_menu)
-
-        # Contact menu
-        contact_menu = tk.Menu(menu_bar, tearoff=0)
-        contact_menu.add_command(label="Contact Developer", command=self.open_contact)
-        menu_bar.add_cascade(label="Contact", menu=contact_menu)
-
-        # Help menu
-        help_menu = tk.Menu(menu_bar, tearoff=0)
-        help_menu.add_command(label="Instructions", command=self.show_instructions)
-        menu_bar.add_cascade(label="Help", menu=help_menu)
-
-        # Attach the menu to the root window
-        self.root.config(menu=menu_bar)
-
-    def open_contact(self):
-        # Open GitHub and Instagram links in browser
-        webbrowser.open("https://github.com/tejasbargujepatil")
-        webbrowser.open("https://instagram.com/Tejas_Barguje_Patil")
-
-    def show_instructions(self):
-        # Show instructions in a message box
-        instructions = """
-        1. Add Files: Use this option to add text, CSV, PDF, HTML, or JSON files.
-        2. Select IOC Types: Choose which types of IOCs (Indicators of Compromise) to extract using checkboxes.
-        3. Set API Key: If you want Threat Enrichment, enter your VirusTotal API key.
-        4. Process Files: After adding files and selecting IOC types, click this button to start processing.
-        5. View Results: The results are displayed in the table. Each IOC type will show associated matches.
-        6. Export: Export the results to CSV or JSON format.
-        """
-        messagebox.showinfo("Help - Instructions", instructions)
-
-    def set_api_key(self):
-        self.api_key = askstring("API Key", "Enter your VirusTotal API Key:")
-        if not self.api_key:
-            messagebox.showerror("Error", "API Key is required for Threat Enrichment.")
-
-    def add_files(self):
-        files = filedialog.askopenfilenames(filetypes=[("Supported Files", "*.txt *.csv *.json *.pdf *.html")])
-        for file in files:
-            if file not in self.files:
-                self.files.append(file)
-                self.file_listbox.insert(tk.END, file)
-
-    def remove_files(self):
-        selected_indices = list(self.file_listbox.curselection())
-        selected_indices.reverse()  # Remove from bottom to avoid index shifting
-        for idx in selected_indices:
-            self.file_listbox.delete(idx)
-            self.files.pop(idx)
-
-    def process_files(self):
-        if not self.files:
-            messagebox.showerror("Error", "No files to process.")
-            return
-
-        # Reset progress bar
-        self.progress['value'] = 0
-        self.progress['maximum'] = len(self.files) * 100
-        self.result_tree.delete(*self.result_tree.get_children())  # Clear old results
-
-        # Start processing in a separate thread
-        thread = Thread(target=self._process_files)
-        thread.start()
-
-    def _process_files(self):
-        for file in self.files:
-            file_type = file.split('.')[-1].lower()
-            content = process_file(file, file_type)
-            self.extract_iocs(file, content)
-            self.progress['value'] += 100
-            time.sleep(0.1)  # Simulate work
-
-    def extract_iocs(self, file, content):
-        iocs = {
-            "md5": md5_pattern.findall(content) if self.md5_var.get() else [],
-            "sha1": sha1_pattern.findall(content) if self.sha1_var.get() else [],
-            "sha256": sha256_pattern.findall(content) if self.sha256_var.get() else [],
-            "sha512": sha512_pattern.findall(content) if self.sha512_var.get() else [],
-            "ipv4": ipv4_pattern.findall(content) if self.ipv4_var.get() else [],
-            "domain": domain_pattern.findall(content) if self.domain_var.get() else [],
-            "url": url_pattern.findall(content) if self.url_var.get() else [],
-            "email": email_pattern.findall(content) if self.email_var.get() else [],
-            "mac": mac_pattern.findall(content) if self.mac_var.get() else [],
-            "path": path_pattern.findall(content) if self.path_var.get() else []
-        }
-
-        self.results[file] = iocs
-
-        # Update GUI with results
-        self.queue.put(iocs)
-
-    def process_queue(self):
-        try:
-            iocs = self.queue.get_nowait()
-            for ioc_type, iocs_list in iocs.items():
-                for ioc in iocs_list:
-                    self.result_tree.insert('', 'end', values=(ioc_type, ioc))
-        except queue.Empty:
-            pass
-
-        self.root.after(100, self.process_queue)
 
     def create_widgets(self):
         # IOC type checkboxes
@@ -197,7 +112,6 @@ class IOCExtractorApp:
         self.mac_var = tk.BooleanVar()
         self.path_var = tk.BooleanVar()
 
-        # Create checkboxes for IOC types
         self.checkbox_frame = tk.Frame(self.root)
         self.checkbox_frame.pack(fill=tk.X)
 
@@ -243,27 +157,98 @@ class IOCExtractorApp:
         checkbox = tk.Checkbutton(self.checkbox_frame, text=text, variable=var)
         checkbox.pack(side=tk.LEFT, padx=5, pady=5)
 
-    def export_results(self):
-        if not self.results:
-            messagebox.showerror("Error", "No results to export.")
+    def add_files(self):
+        files = filedialog.askopenfilenames(filetypes=[("Supported Files", "*.txt *.csv *.json *.pdf *.html")])
+        for file in files:
+            if file not in self.files:
+                encrypted_path = self.encrypt_and_store(file)
+                if encrypted_path:
+                    self.files.append(encrypted_path)
+                    self.file_listbox.insert(tk.END, encrypted_path)
+
+    def remove_files(self):
+        selected_indices = list(self.file_listbox.curselection())
+        selected_indices.reverse()
+        for idx in selected_indices:
+            self.file_listbox.delete(idx)
+            self.files.pop(idx)
+
+    def process_files(self):
+        if not self.files:
+            messagebox.showerror("Error", "No files to process.")
             return
 
-        export_type = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Files", "*.json"), ("CSV Files", "*.csv")])
+        # Reset progress bar
+        self.progress['value'] = 0
+        self.progress['maximum'] = len(self.files) * 100
+        self.result_tree.delete(*self.result_tree.get_children())
 
-        if export_type.endswith(".json"):
-            with open(export_type, "w") as json_file:
-                json.dump(self.results, json_file, indent=4)
+        # Start processing in a separate thread
+        thread = Thread(target=self._process_files_in_background)
+        thread.start()
 
-        elif export_type.endswith(".csv"):
-            with open(export_type, "w", newline="") as csv_file:
-                writer = csv.writer(csv_file)
-                writer.writerow(["File", "IOC Type", "IOC"])
-                for file, iocs in self.results.items():
-                    for ioc_type, iocs_list in iocs.items():
-                        for ioc in iocs_list:
-                            writer.writerow([file, ioc_type, ioc])
+    def _process_files_in_background(self):
+        for file_path in self.files:
+            self.process_file(file_path)
+            self.progress['value'] += 100
+            self.root.update_idletasks()
 
-# Run the application
+    def process_file(self, file_path):
+        file_type = "text/plain"  # In reality, you'd detect the MIME type here
+        text = process_file(file_path, file_type)
+        iocs = self.extract_iocs(text)
+        for ioc_type, iocs_list in iocs.items():
+            for ioc in iocs_list:
+                enriched = enrich_with_virustotal(ioc, self.api_key) if self.api_key else {}
+                self.result_tree.insert("", "end", values=(ioc_type, ioc))
+                logging.info(f"Processed IOC: {ioc} (Type: {ioc_type})")
+
+    def extract_iocs(self, text):
+        iocs = {}
+        if self.md5_var.get():
+            iocs["MD5"] = md5_pattern.findall(text)
+        if self.sha1_var.get():
+            iocs["SHA1"] = sha1_pattern.findall(text)
+        if self.sha256_var.get():
+            iocs["SHA256"] = sha256_pattern.findall(text)
+        if self.sha512_var.get():
+            iocs["SHA512"] = sha512_pattern.findall(text)
+        if self.ipv4_var.get():
+            iocs["IPv4"] = ipv4_pattern.findall(text)
+        if self.domain_var.get():
+            iocs["Domain"] = domain_pattern.findall(text)
+        if self.url_var.get():
+            iocs["URL"] = url_pattern.findall(text)
+        if self.email_var.get():
+            iocs["Email"] = email_pattern.findall(text)
+        if self.mac_var.get():
+            iocs["MAC Address"] = mac_pattern.findall(text)
+        if self.path_var.get():
+            iocs["File Path"] = path_pattern.findall(text)
+        return iocs
+
+    def encrypt_and_store(self, file_path):
+        """Encrypt the file and save it securely."""
+        encrypted_data = encrypt_file(file_path, self.encryption_key)
+        if encrypted_data:
+            encrypted_path = os.path.join(secure_storage_dir, f"{os.path.basename(file_path)}.enc")
+            with open(encrypted_path, "wb") as f:
+                f.write(encrypted_data)
+            logging.info(f"Encrypted file stored: {encrypted_path}")
+            return encrypted_path
+        return None
+
+    def export_results(self):
+        # Export IOCs to CSV
+        with open("iocs.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["IOC Type", "IOC"])
+            for row in self.result_tree.get_children():
+                writer.writerow(self.result_tree.item(row)["values"])
+        messagebox.showinfo("Export", "Results exported to iocs.csv.")
+
+# Initialize application
+secure_key = sha256(b"super_secret_key").digest()  # Example key
 root = tk.Tk()
-app = IOCExtractorApp(root)
+app = IOCExtractorApp(root, secure_key)
 root.mainloop()
